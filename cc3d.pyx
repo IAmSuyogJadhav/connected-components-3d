@@ -7,6 +7,10 @@ Author: William Silversmith
 Affiliation: Seung Lab, Princeton Neuroscience Institute
 Date: August 2018 - June 2023
 
+Modified by: Suyog Jadhav
+Affiliation: UiT The Arctic University of Norway
+Date: August 2023
+
 ---
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -54,7 +58,11 @@ cimport numpy as cnp
 import numpy as np
 import time
 
-__VERSION__ = '3.12.1'
+# Suyog
+from libc.stdio cimport printf
+from libc.time cimport time,time_t
+__VERSION__ = '3.12.2'
+
 
 cdef extern from "cc3d.hpp" namespace "cc3d":
   cdef size_t estimate_provisional_label_count[T](
@@ -589,6 +597,7 @@ cdef size_t epl_special_row(
 @cython.binding(True)
 def statistics(
   out_labels:np.ndarray, 
+  max_label:int = 0,  #Suyog
   no_slice_conversion:bool = False,
 ) -> dict:
   """
@@ -622,7 +631,7 @@ def statistics(
   if out_labels.dtype == bool:
     out_labels = out_labels.view(np.uint8)
 
-  return _statistics(out_labels, no_slice_conversion)
+  return _statistics(out_labels, no_slice_conversion, np.uint64(max_label))  #Suyog
 
 @cython.cdivision(True)
 @cython.boundscheck(False)
@@ -630,7 +639,8 @@ def statistics(
 @cython.nonecheck(False)
 def _statistics(
   cnp.ndarray[UINT, ndim=3] out_labels, 
-  native_bool no_slice_conversion
+  native_bool no_slice_conversion,
+  uint64_t max_label = 0,  #Suyog
 ):
   cdef uint64_t voxels = out_labels.size;
   cdef uint64_t sx = out_labels.shape[0]
@@ -644,7 +654,18 @@ def _statistics(
       "centroids": None,
     }
 
-  cdef uint64_t N = np.max(out_labels)
+  ##Suyog
+  # cdef uint64_t N = np.max(out_labels)
+  # if not max_label:
+  #   cdef uint64_t N = np.max(out_labels)
+  # else:
+  cdef uint64_t N = max_label
+  # printf("N is set to: %d", N)
+  print("N is set to: ", N)
+  ##Suyog
+
+  if N == 0:
+    raise ValueError("Please set max_label.")
 
   if N > voxels:
     raise ValueError(
@@ -654,6 +675,7 @@ def _statistics(
   if np.any(np.array([sx, sy, sz]) > np.iinfo(np.uint16).max):
     raise ValueError(f"Only dimensions shorter than 65536 are supported. Shape: {sx}, {sy}, {sz}")
 
+  print("Initializing arrays...")
   cdef cnp.ndarray[uint32_t] counts = np.zeros(N + 1, dtype=np.uint32)
   cdef cnp.ndarray[uint16_t] bounding_boxes = np.zeros(6 * (N + 1), dtype=np.uint16)
   cdef cnp.ndarray[float] centroids = np.zeros(3 * (N + 1), dtype=np.float32)
@@ -666,6 +688,9 @@ def _statistics(
 
   bounding_boxes[::2] = np.iinfo(bounding_boxes.dtype).max
 
+  print("Computing statistics...")
+  # # record time (cython)
+  # t1 = time(NULL)
   if out_labels.flags.f_contiguous:
     for z in range(sz):
       for y in range(sy):
@@ -681,6 +706,9 @@ def _statistics(
           centroids[3 * label + 0] += <float>x
           centroids[3 * label + 1] += <float>y
           centroids[3 * label + 2] += <float>z
+    # printf("\r%d/%d/%d ", sx, sy, sz)
+          # print("time taken: ", time(NULL) - t1)
+          # t1 = time(NULL)
   else:
     for x in range(sx):
       for y in range(sy):
@@ -696,7 +724,8 @@ def _statistics(
           centroids[3 * label + 0] += <float>x
           centroids[3 * label + 1] += <float>y
           centroids[3 * label + 2] += <float>z
-
+          # print("time taken: ", time(NULL) - t1)
+          # t1 = time(NULL)
   for label in range(N+1):
     centroids[3 * label + 0] /= <float>counts[label]
     centroids[3 * label + 1] /= <float>counts[label]
@@ -721,6 +750,7 @@ def _statistics(
       slices.append(None)
   
   output["bounding_boxes"] = slices
+  print("\nDone")
 
   return output
 

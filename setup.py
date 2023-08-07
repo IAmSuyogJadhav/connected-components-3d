@@ -2,15 +2,16 @@ import os
 import setuptools
 import sys
 
+# Suyog
+import numpy as np
+# class NumpyImport:
+#   def __repr__(self):
+#     import numpy as np
 
-class NumpyImport:
-  def __repr__(self):
-    import numpy as np
+#     return np.get_include()
 
-    return np.get_include()
-
-  __fspath__ = __repr__
-
+#   __fspath__ = __repr__
+np_path = np.get_include()
 
 def read(fname):
   with open(os.path.join(os.path.dirname(__file__), fname), 'rt') as f:
@@ -38,7 +39,7 @@ if sys.platform == 'darwin':
 
 setuptools.setup(
   name="connected-components-3d",
-  version="3.12.1",
+  version="3.12.2",
   setup_requires=['pbr', 'numpy', 'cython'],
   install_requires=['numpy'],
   python_requires=">=3.7,<4.0",
@@ -47,7 +48,8 @@ setuptools.setup(
       'cc3d',
       sources=[ 'cc3d.pyx' ],
       language='c++',
-      include_dirs=[ NumpyImport() ],
+      # include_dirs=[ NumpyImport() ], # Suyog
+      include_dirs=[ np_path ],  # Suyog
       extra_compile_args=extra_compile_args,
     )
   ],
