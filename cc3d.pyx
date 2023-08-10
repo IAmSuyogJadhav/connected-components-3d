@@ -597,8 +597,10 @@ cdef size_t epl_special_row(
 @cython.binding(True)
 def statistics(
   out_labels:np.ndarray, 
-  max_label:int = 0,  #Suyog
+  max_label:int = 0,  #Suyog: 0==max_label is computed (old behavior)
+  new_impl:bool = False,  #Suyog: use new implementation
   no_slice_conversion:bool = False,
+  chunk_size:int = 1 #Suyog: chunk size for new implementation
 ) -> dict:
   """
   Compute basic statistics on the regions in the image.
@@ -631,7 +633,7 @@ def statistics(
   if out_labels.dtype == bool:
     out_labels = out_labels.view(np.uint8)
 
-  return _statistics(out_labels, no_slice_conversion, np.uint64(max_label))  #Suyog
+  return _statistics(out_labels, no_slice_conversion, np.uint64(max_label), new_impl, np.uint16(chunk_size))  #Suyog
 
 @cython.cdivision(True)
 @cython.boundscheck(False)
@@ -640,7 +642,9 @@ def statistics(
 def _statistics(
   cnp.ndarray[UINT, ndim=3] out_labels, 
   native_bool no_slice_conversion,
-  uint64_t max_label = 0,  #Suyog
+  uint64_t max_label = 0,  #Suyog: To avoid manual computation of max_label, set this to value > 0
+  native_bool new_impl = False,  #Suyog: Use new implementation
+  uint16_t chunk_size = 1  #Suyog: No. of frames to process in one go
 ):
   cdef uint64_t voxels = out_labels.size;
   cdef uint64_t sx = out_labels.shape[0]
@@ -661,11 +665,15 @@ def _statistics(
   # else:
   cdef uint64_t N = max_label
   # printf("N is set to: %d", N)
-  print("N is set to: ", N)
-  ##Suyog
 
   if N == 0:
-    raise ValueError("Please set max_label.")
+    # raise ValueError("Please set max_label.")
+    print("[WARN] Computing max_label. May take a long time. "
+    "Please set max_label to avoid expensive computation.")
+    N = np.max(out_labels)
+
+  print("N is set to: ", N)
+  ##Suyog
 
   if N > voxels:
     raise ValueError(
@@ -691,41 +699,158 @@ def _statistics(
   print("Computing statistics...")
   # # record time (cython)
   # t1 = time(NULL)
-  if out_labels.flags.f_contiguous:
-    for z in range(sz):
-      for y in range(sy):
-        for x in range(sx):
-          label = <uint64_t>out_labels[x,y,z]
-          counts[label] += 1
-          bounding_boxes[6 * label + 0] = <uint16_t>min(bounding_boxes[6 * label + 0], x)
-          bounding_boxes[6 * label + 1] = <uint16_t>max(bounding_boxes[6 * label + 1], x)
-          bounding_boxes[6 * label + 2] = <uint16_t>min(bounding_boxes[6 * label + 2], y)
-          bounding_boxes[6 * label + 3] = <uint16_t>max(bounding_boxes[6 * label + 3], y)
-          bounding_boxes[6 * label + 4] = <uint16_t>min(bounding_boxes[6 * label + 4], z)
-          bounding_boxes[6 * label + 5] = <uint16_t>max(bounding_boxes[6 * label + 5], z)
-          centroids[3 * label + 0] += <float>x
-          centroids[3 * label + 1] += <float>y
-          centroids[3 * label + 2] += <float>z
-    # printf("\r%d/%d/%d ", sx, sy, sz)
-          # print("time taken: ", time(NULL) - t1)
-          # t1 = time(NULL)
+
+  # Suyog: New implementation (testing)
+  if new_impl:
+    print("Using new implementation...")
+    
+    if out_labels.flags.f_contiguous:
+      print("Using f_contiguous array mode...")
+      print("Initializing buffers...")
+      chunk = np.zeros((sx, sy, chunk_size), dtype=np.uint64)
+
+      print("Starting the main loop...")
+      for z in range(0, sz, chunk_size):
+        chunk_size = min(chunk_size, sz - z)
+        chunk[..., :chunk_size] = out_labels[..., z : z + chunk_size]
+        _chunk = chunk[..., :chunk_size]  # convenience
+
+        # Gather all labels and their counts
+        _labels, _counts = np.unique(_chunk, return_counts=True)
+
+        # Update counts
+        counts[_labels] += _counts.astype(np.uint32)
+
+        for label in _labels:
+          _chunk_masked = _chunk == label
+
+          # Get all x, y, z indices for the current label
+          x_indices, y_indices, z_indices = np.nonzero(_chunk_masked)
+
+          # Find min and max for x, y, z
+          x_min = np.argmax(np.any(_chunk_masked, axis=(1, 2)))  # 0 == x axis
+          y_min = np.argmax(np.any(_chunk_masked, axis=(0, 2)))  # 1 == y axis
+          z_min = np.argmax(np.any(_chunk_masked, axis=(0, 1)))  # 2 == z axis
+
+          x_max = _chunk_masked.shape[0] - np.argmax(np.any(_chunk_masked[::-1, :, :], axis=(1, 2))) - 1
+          y_max = _chunk_masked.shape[1] - np.argmax(np.any(_chunk_masked[:, ::-1, :], axis=(0, 2))) - 1
+          z_max = _chunk_masked.shape[2] - np.argmax(np.any(_chunk_masked[:, :, ::-1], axis=(0, 1))) - 1
+
+          # Adjust for chunk offset
+          # print(z_min, z_max) #debug
+          z_indices += z
+          z_min += z
+          z_max += z
+          # print(z_min, z_max) #debug
+
+          # Update bounding boxes
+          bounding_boxes[6 * label + 0] = <uint16_t>np.minimum(bounding_boxes[6 * label + 0], x_min)
+          bounding_boxes[6 * label + 1] = <uint16_t>np.maximum(bounding_boxes[6 * label + 1], x_max)
+          bounding_boxes[6 * label + 2] = <uint16_t>np.minimum(bounding_boxes[6 * label + 2], y_min)
+          bounding_boxes[6 * label + 3] = <uint16_t>np.maximum(bounding_boxes[6 * label + 3], y_max)
+          bounding_boxes[6 * label + 4] = <uint16_t>np.minimum(bounding_boxes[6 * label + 4], z_min)
+          bounding_boxes[6 * label + 5] = <uint16_t>np.maximum(bounding_boxes[6 * label + 5], z_max)
+
+          # Update centroids
+          centroids[3 * label + 0] += <float>np.sum(x_indices)
+          centroids[3 * label + 1] += <float>np.sum(y_indices)
+          centroids[3 * label + 2] += <float>np.sum(z_indices)
+
+    else:
+      print("Using c_contiguous array mode...")
+      print("Initializing buffers...")
+      chunk = np.zeros((chunk_size, sy, sz), dtype=np.uint64)
+
+      print("Starting the main loop...")
+      for x in range(0, sx, chunk_size):
+        chunk_size = min(chunk_size, sx - x)
+        chunk[:chunk_size, ...] = out_labels[x : x + chunk_size, ...]
+        _chunk = chunk[:chunk_size, ...]  # convenience
+        # print(_chunk.shape) #debug
+
+        # Gather all labels and their counts
+        _labels, _counts = np.unique(_chunk, return_counts=True)
+
+        # Update counts
+        counts[_labels] += _counts.astype(np.uint32)
+
+        for label in _labels:
+          _chunk_masked = _chunk == label
+
+          # Get all x, y, z indices for the current label
+          x_indices, y_indices, z_indices = np.nonzero(_chunk_masked)
+
+          # Find min and max for x, y, z
+          x_min = np.argmax(np.any(_chunk_masked, axis=(1, 2)))  # 0 == x axis
+          y_min = np.argmax(np.any(_chunk_masked, axis=(0, 2)))  # 1 == y axis
+          z_min = np.argmax(np.any(_chunk_masked, axis=(0, 1)))  # 2 == z axis
+
+          x_max = _chunk_masked.shape[0] - np.argmax(np.any(_chunk_masked[::-1, :, :], axis=(1, 2))) - 1
+          y_max = _chunk_masked.shape[1] - np.argmax(np.any(_chunk_masked[:, ::-1, :], axis=(0, 2))) - 1
+          z_max = _chunk_masked.shape[2] - np.argmax(np.any(_chunk_masked[:, :, ::-1], axis=(0, 1))) - 1
+
+          # Adjust for chunk offset
+          # print(x_min, x_max) #debug
+          x_indices += x 
+          x_min += x
+          x_max += x
+          # print(x_min, x_max) #debug
+
+          # Update bounding boxes
+          bounding_boxes[6 * label + 0] = <uint16_t>np.minimum(bounding_boxes[6 * label + 0], x_min)
+          bounding_boxes[6 * label + 1] = <uint16_t>np.maximum(bounding_boxes[6 * label + 1], x_max)
+          bounding_boxes[6 * label + 2] = <uint16_t>np.minimum(bounding_boxes[6 * label + 2], y_min)
+          bounding_boxes[6 * label + 3] = <uint16_t>np.maximum(bounding_boxes[6 * label + 3], y_max)
+          bounding_boxes[6 * label + 4] = <uint16_t>np.minimum(bounding_boxes[6 * label + 4], z_min)
+          bounding_boxes[6 * label + 5] = <uint16_t>np.maximum(bounding_boxes[6 * label + 5], z_max)
+          
+          # Update centroids
+          centroids[3 * label + 0] += <float>np.sum(x_indices)
+          centroids[3 * label + 1] += <float>np.sum(y_indices)
+          centroids[3 * label + 2] += <float>np.sum(z_indices)
+
+    # print(f"Counts[:10]: {counts[:10]}") #debug
+
   else:
-    for x in range(sx):
-      for y in range(sy):
-        for z in range(sz):    
-          label = <uint64_t>out_labels[x,y,z]
-          counts[label] += 1
-          bounding_boxes[6 * label + 0] = <uint16_t>min(bounding_boxes[6 * label + 0], x)
-          bounding_boxes[6 * label + 1] = <uint16_t>max(bounding_boxes[6 * label + 1], x)
-          bounding_boxes[6 * label + 2] = <uint16_t>min(bounding_boxes[6 * label + 2], y)
-          bounding_boxes[6 * label + 3] = <uint16_t>max(bounding_boxes[6 * label + 3], y)
-          bounding_boxes[6 * label + 4] = <uint16_t>min(bounding_boxes[6 * label + 4], z)
-          bounding_boxes[6 * label + 5] = <uint16_t>max(bounding_boxes[6 * label + 5], z)
-          centroids[3 * label + 0] += <float>x
-          centroids[3 * label + 1] += <float>y
-          centroids[3 * label + 2] += <float>z
-          # print("time taken: ", time(NULL) - t1)
-          # t1 = time(NULL)
+    if out_labels.flags.f_contiguous:
+      for z in range(sz):
+        for y in range(sy):
+          for x in range(sx):
+            label = <uint64_t>out_labels[x,y,z]
+            counts[label] += 1
+            bounding_boxes[6 * label + 0] = <uint16_t>min(bounding_boxes[6 * label + 0], x)
+            bounding_boxes[6 * label + 1] = <uint16_t>max(bounding_boxes[6 * label + 1], x)
+            bounding_boxes[6 * label + 2] = <uint16_t>min(bounding_boxes[6 * label + 2], y)
+            bounding_boxes[6 * label + 3] = <uint16_t>max(bounding_boxes[6 * label + 3], y)
+            bounding_boxes[6 * label + 4] = <uint16_t>min(bounding_boxes[6 * label + 4], z)
+            bounding_boxes[6 * label + 5] = <uint16_t>max(bounding_boxes[6 * label + 5], z)
+            centroids[3 * label + 0] += <float>x
+            centroids[3 * label + 1] += <float>y
+            centroids[3 * label + 2] += <float>z
+      # printf("\r%d/%d/%d ", sx, sy, sz)
+            # print("time taken: ", time(NULL) - t1)
+            # t1 = time(NULL)
+    else:
+      for x in range(sx):
+        for y in range(sy):
+          for z in range(sz):    
+            label = <uint64_t>out_labels[x,y,z]
+            counts[label] += 1
+            bounding_boxes[6 * label + 0] = <uint16_t>min(bounding_boxes[6 * label + 0], x)
+            bounding_boxes[6 * label + 1] = <uint16_t>max(bounding_boxes[6 * label + 1], x)
+            bounding_boxes[6 * label + 2] = <uint16_t>min(bounding_boxes[6 * label + 2], y)
+            bounding_boxes[6 * label + 3] = <uint16_t>max(bounding_boxes[6 * label + 3], y)
+            bounding_boxes[6 * label + 4] = <uint16_t>min(bounding_boxes[6 * label + 4], z)
+            bounding_boxes[6 * label + 5] = <uint16_t>max(bounding_boxes[6 * label + 5], z)
+            centroids[3 * label + 0] += <float>x
+            centroids[3 * label + 1] += <float>y
+            centroids[3 * label + 2] += <float>z
+            # print("time taken: ", time(NULL) - t1)
+            # t1 = time(NULL)
+      
+    # print(f"Counts[:10]: {counts[:10]}") #debug
+
+  print("Computing centroids...")
   for label in range(N+1):
     centroids[3 * label + 0] /= <float>counts[label]
     centroids[3 * label + 1] /= <float>counts[label]
